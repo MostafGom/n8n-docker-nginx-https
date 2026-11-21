@@ -1,0 +1,21 @@
+# Reverse proxy: the only container that publishes ports to your machine.
+# Every app joins the "local-shared" network and nginx forwards HTTPS traffic to it.
+name: local-proxy
+
+services:
+  nginx:
+    image: nginx:1.30.7-alpine
+    restart: unless-stopped
+    ports:
+      # 127.0.0.1 = reachable from this computer only, not from your network.
+      - "127.0.0.1:80:80"
+      - "127.0.0.1:443:443"
+    volumes:
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks:
+      - local-shared
+
+networks:
+  local-shared:
+    external: true

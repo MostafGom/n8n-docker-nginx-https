@@ -1,0 +1,162 @@
+# n8n in queue mode: a main instance (editor, triggers, webhooks) hands
+# executions to worker instances through a Redis queue.
+# Opens at https://n8n-queue.apps.mylocalhost through the nginx proxy in ../nginx.
+#
+# Values written as ${NAME} come from the .env file in this folder.
+# Create it with ./generate-env.sh (or .\generate-env.ps1 on Windows).
+name: n8n-queue-local
+
+# Settings shared by the main instance and every worker.
+x-n8n: &n8n
+  image: n8nio/n8n:${N8N_VERSION}
+  restart: unless-stopped
+  environment:
+    # Database
+    DB_TYPE: postgresdb
+    DB_POSTGRESDB_HOST: postgres
+    DB_POSTGRESDB_PORT: 5432
+    DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+    DB_POSTGRESDB_USER: ${POSTGRES_USER}
+    DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+    # Queue mode
+    EXECUTIONS_MODE: queue
+    QUEUE_BULL_REDIS_HOST: redis
+    QUEUE_BULL_REDIS_PORT: 6379
+    QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+    QUEUE_HEALTH_CHECK_ACTIVE: "true"
+    # Runs made with the editor's "Execute workflow" button also go to the workers.
+    OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+
+    # Encrypts saved credentials. Must be identical on main and all workers.
+    N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+    N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+
+    # Public address. Workers need it too: they build webhook and form links.
+    N8N_HOST: ${N8N_HOST}
+    N8N_PORT: 5678
+    N8N_PROTOCOL: https
+    N8N_WEBHOOK_URL: https://${N8N_HOST}/
+    N8N_EDITOR_BASE_URL: https://${N8N_HOST}/
+    N8N_PROXY_HOPS: 1
+
+    # Code nodes run in separate task runner containers (one per n8n container).
+    N8N_RUNNERS_MODE: external
+    N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+    N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
+
+    # Timezone
+    GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+    TZ: ${GENERIC_TIMEZONE}
+  healthcheck:
+    test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:5678/healthz || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 12
+    start_period: 30s
+
+# A worker: same image, started with the "worker" command.
+x-worker: &worker
+  <<: *n8n
+  command: worker --concurrency=${N8N_WORKER_CONCURRENCY}
+  depends_on:
+    n8n-queue-main:
+      condition: service_healthy
+
+# A task runner. Its version must always match the n8n version.
+x-runners: &runners
+  image: n8nio/runners:${N8N_VERSION}
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:17.12-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8.8.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    environment:
+      # Lets the healthcheck below authenticate.
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Main instance: the editor, triggers and webhooks. The only one nginx talks to.
+  n8n-queue-main:
+    <<: *n8n
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - default
+      - local-shared
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  n8n-queue-main-runners:
+    <<: *runners
+    environment:
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n-queue-main:5679
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+    depends_on:
+      n8n-queue-main:
+        condition: service_healthy
+
+  # Worker 1 and its task runner.
+  n8n-queue-worker-1:
+    <<: *worker
+
+  n8n-queue-worker-1-runners:
+    <<: *runners
+    environment:
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n-queue-worker-1:5679
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+    depends_on:
+      n8n-queue-worker-1:
+        condition: service_healthy
+
+  # Worker 2 and its task runner. Off by default.
+  # Start them with: docker compose --profile extra-workers up -d
+  n8n-queue-worker-2:
+    <<: *worker
+    profiles: ["extra-workers"]
+
+  n8n-queue-worker-2-runners:
+    <<: *runners
+    profiles: ["extra-workers"]
+    environment:
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n-queue-worker-2:5679
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN}
+    depends_on:
+      n8n-queue-worker-2:
+        condition: service_healthy
+
+networks:
+  # Shared with nginx. Create it once: docker network create local-shared
+  local-shared:
+    external: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  n8n_data:

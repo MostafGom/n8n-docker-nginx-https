@@ -1,0 +1,34 @@
+# TEMPLATE for a new app. Copy it to nginx/conf.d/<name>.conf, then change the
+# two lines marked CHANGE ME. Full walkthrough: docs/06-add-another-app.md
+server {
+    listen 443 ssl;
+    http2 on;
+    # CHANGE ME: the address you want. It must end in .apps.mylocalhost
+    server_name myapp.apps.mylocalhost;
+
+    # Allow large uploads (files sent to webhooks and forms).
+    client_max_body_size 128m;
+
+    location / {
+        # CHANGE ME: <service name>:<port the app listens on inside its container>
+        set $upstream http://myapp:3000;
+        proxy_pass $upstream;
+        proxy_http_version 1.1;
+
+        # Tell the app the original address the browser used.
+        proxy_set_header Host              $http_host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host  $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSockets.
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        # Send responses straight through (needed for streaming and server-sent events).
+        proxy_buffering off;
+    }
+}
